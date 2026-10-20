@@ -20,7 +20,6 @@ def test_passive_capture_with_synthetic_ros_inputs(
 ):
     rclpy = pytest.importorskip('rclpy')
     from aimdk_msgs.msg import JointState, JointStateArray
-    from nav_msgs.msg import Odometry
     from rclpy.context import Context
     from sensor_msgs.msg import CameraInfo, CompressedImage
 
@@ -54,7 +53,9 @@ def test_passive_capture_with_synthetic_ros_inputs(
         **{f'k{i}': 0.001 for i in range(2, 8)},
     }
     calib_path = tmp_path / 'calib.yaml'
-    calib_path.write_text(yaml.safe_dump({'cam_0': fish}))
+    calib_path.write_text(yaml.safe_dump({
+        'cam_0': fish, 'Tcl_0': np.eye(4).ravel().tolist(),
+    }))
     image = np.full((480, 640, 3), 255, dtype=np.uint8)
     for row in range(7):
         for col in range(9):
@@ -72,7 +73,6 @@ def test_passive_capture_with_synthetic_ros_inputs(
     odin_pub = node.create_publisher(CompressedImage, odin_topic, 10)
     info_pub = node.create_publisher(CameraInfo, info_topic, 10)
     state_pub = node.create_publisher(JointStateArray, state_topic, 10)
-    internal_pub = node.create_publisher(Odometry, internal_topic, 10)
     output = tmp_path / 'session'
     command = [
         sys.executable,
@@ -138,16 +138,8 @@ def test_passive_capture_with_synthetic_ros_inputs(
                     JointState(name=name, position=0.0)
                     for name in ('head_yaw_joint', 'head_pitch_joint')
                 ]
-                internal = Odometry()
-                internal.header.stamp = stamp
-                matrix = np.eye(4).ravel().tolist() + [0.0] * 20
-                # /wiwc is refined online; this must not stop capture after pair 1.
-                matrix[3] = 0.0001 * (time.monotonic() - start)
-                internal.pose.covariance = matrix
-                internal.twist.covariance = matrix
                 state_pub.publish(state)
                 info_pub.publish(info)
-                internal_pub.publish(internal)
                 head_pub.publish(head)
                 odin_pub.publish(odin)
                 time.sleep(0.03)
@@ -160,12 +152,12 @@ def test_passive_capture_with_synthetic_ros_inputs(
             len(sample['head_corners']) == 48 for sample in metadata['samples']
         )
         assert metadata['samples'][0]['head_state_samples']
-        first, second = metadata['samples']
-        assert (
-            first['internal']['T_camera_lidar']
-            != second['internal']['T_camera_lidar']
+        # No WIWC publisher exists: factory geometry alone must admit capture.
+        assert metadata['factory_internal']['T_imu_lidar'][0][3] == -0.02663
+        assert all(
+            s['internal'] == metadata['factory_internal']
+            for s in metadata['samples']
         )
-        assert first['internal_stamp'] < second['internal_stamp']
         assert len(list((output / 'images').glob('*.jpg'))) == 4
     finally:
         if process is not None and process.poll() is None:

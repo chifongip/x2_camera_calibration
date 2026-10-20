@@ -19,7 +19,7 @@ from .session import (
     HEAD_JOINTS,
     camera_models_match,
     fingerprint,
-    internal_extrinsics,
+    factory_extrinsics,
     load_yaml,
     stable_head,
     write_yaml,
@@ -73,7 +73,9 @@ def _parser():
     parser.add_argument('--head-info', default=HEAD_INFO)
     parser.add_argument('--head-state', default=HEAD_STATE)
     parser.add_argument('--odin-image', default='/odin1/image/compressed')
-    parser.add_argument('--odin-internal', default='/odin1/wiwc')
+    parser.add_argument(
+        '--odin-internal', help='Deprecated compatibility option; ignored'
+    )
     parser.add_argument('--columns', type=int, default=8)
     parser.add_argument('--rows', type=int, default=6)
     parser.add_argument('--square-size', type=float, default=0.035)
@@ -163,6 +165,7 @@ def main(argv=None):
         kinematics = HeadKinematics(urdf)
         odin_file = load_yaml(args.odin_calib)
         odin = odin_file['cam_0']
+        internal = factory_extrinsics(odin_file)
         project(
             odin, [[0, 0, 1]]
         )  # Fail before creating files for unsupported calibration.
@@ -178,7 +181,6 @@ def main(argv=None):
     # Import ROS only for live capture; solve/validate work without ROS imports.
     import rclpy
     from aimdk_msgs.msg import JointStateArray
-    from nav_msgs.msg import Odometry
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import CameraInfo, CompressedImage
 
@@ -186,9 +188,10 @@ def main(argv=None):
     node = rclpy.create_node('x2_camera_calibration_capture')
     lock = threading.Lock()
     buffers = {'head': deque(maxlen=60), 'odin': deque(maxlen=30)}
-    state = {'head': deque(maxlen=1000), 'calibration_error': None}
+    state = {'head': deque(maxlen=1000)}
     metadata = {
         'version': 1,
+        'factory_internal': internal,
         'session_id': str(uuid.uuid4()),
         'created_utc': datetime.now(timezone.utc).isoformat(),
         'board': {
@@ -210,7 +213,6 @@ def main(argv=None):
             'head_info': args.head_info,
             'head_state': args.head_state,
             'odin_image': args.odin_image,
-            'odin_internal': args.odin_internal,
         },
         'head_timestamp_policy': 'header.meas_stamp when nonzero, otherwise header.stamp',
         'samples': [],
@@ -247,18 +249,6 @@ def main(argv=None):
             state['head'].append({'stamp': stamp, 'positions': positions})
             state['head_received'] = time.monotonic()
 
-    def internal_callback(message):
-        try:
-            value = internal_extrinsics(message)
-            with lock:
-                state['internal'] = value
-                state['internal_stamp'] = stamp_seconds(message.header.stamp)
-                state['internal_received'] = time.monotonic()
-                state['calibration_error'] = None
-        except ValueError as error:
-            with lock:
-                state['calibration_error'] = str(error)
-
     subscriptions = [
         node.create_subscription(
             CompressedImage,
@@ -279,12 +269,6 @@ def main(argv=None):
             JointStateArray,
             args.head_state,
             head_callback,
-            qos_profile_sensor_data,
-        ),
-        node.create_subscription(
-            Odometry,
-            args.odin_internal,
-            internal_callback,
             qos_profile_sensor_data,
         ),
     ]
@@ -335,8 +319,6 @@ def main(argv=None):
             while len(cached) > 8:
                 cached.pop(next(iter(cached)))
             try:
-                if snapshot['calibration_error']:
-                    raise ValueError(snapshot['calibration_error'])
                 if any(not values for values in images.values()):
                     raise ValueError(
                         'Waiting for both compressed image streams'
@@ -399,21 +381,14 @@ def main(argv=None):
                         if key
                         in {('head', stamps['head']), ('odin', stamps['odin'])}
                     }
-                if 'head_model' not in snapshot or 'internal' not in snapshot:
-                    raise ValueError(
-                        'Waiting for head CameraInfo and Odin /wiwc internal extrinsics'
-                    )
-                if (
-                    now - snapshot.get('head_received', 0) > 0.5
-                    or now - snapshot.get('internal_received', 0) > 1
-                ):
-                    raise ValueError(
-                        'Head state or Odin internal extrinsics are stale'
-                    )
+                if 'head_model' not in snapshot:
+                    raise ValueError('Waiting for head CameraInfo')
+                if now - snapshot.get('head_received', 0) > 0.5:
+                    raise ValueError('Head state is stale')
                 calibration = {
                     'head': snapshot['head_model'],
                     'odin': odin,
-                    'internal': snapshot['internal'],
+                    'internal': internal,
                 }
                 if 'calibration' in metadata and not camera_models_match(
                     metadata['calibration'], calibration
@@ -619,8 +594,7 @@ def main(argv=None):
                         name: m.header.frame_id for name, m in messages.items()
                     },
                     'head_positions': head_positions,
-                    'internal': snapshot['internal'],
-                    'internal_stamp': snapshot['internal_stamp'],
+                    'internal': internal,
                     'head_state_samples': [
                         s
                         for s in snapshot['head']

@@ -18,7 +18,9 @@ from x2_camera_calibration.offline import (
     solve_session,
     validate_main,
 )
-from x2_camera_calibration.session import fingerprint, load_session, write_yaml
+from x2_camera_calibration.session import (
+    factory_extrinsics, fingerprint, load_session, write_yaml,
+)
 
 URDF = '''<robot name="test">
 <joint name="head_yaw_joint" type="revolute"><parent link="torso_link"/>
@@ -57,14 +59,14 @@ def dataset():
         'k6': -0.05007,
         'k7': 0.009814,
     }
-    imu_camera = pose([0.1, -0.2, 0.05], [0.03, -0.01, 0.02])
     camera_lidar = pose([-0.2, 0.05, 0.1], [0.04, -0.005, -0.008])
-    internal = {
-        'T_camera_lidar': camera_lidar.tolist(),
-        'T_imu_lidar': (imu_camera @ camera_lidar).tolist(),
-    }
+    internal = factory_extrinsics({'Tcl_0': camera_lidar.ravel().tolist()})
+    imu_camera = (
+        np.array(internal['T_imu_lidar']) @ inverse(camera_lidar)
+    )
     meta = {
         'version': 1,
+        'factory_internal': internal,
         'board': {'columns': 8, 'rows': 6, 'square_size_m': 0.035},
         'max_pair_delta_sec': 0.03,
         'urdf_sha256': fingerprint(URDF),
@@ -136,14 +138,15 @@ def test_noisy_metric_recovery_and_independent_validation(dataset):
     assert angle < 0.1
 
 
-def test_per_observation_internal_extrinsics_override_old_session_snapshot(
-    dataset,
-):
+def test_wiwc_snapshots_do_not_change_factory_mounting(dataset):
     meta, expected_mount, _ = dataset
-    for sample in meta['samples']:
-        sample['internal'] = deepcopy(meta['calibration']['internal'])
-    # A different old snapshot must not affect observations with their own matrices.
+    # Neither the session-wide nor per-observation legacy WIWC matrices may
+    # affect the physical mounting calculation or independent validation.
+    meta['calibration']['internal'] = deepcopy(meta['factory_internal'])
     meta['calibration']['internal']['T_imu_lidar'][0][3] += 0.25
+    for index, sample in enumerate(meta['samples']):
+        sample['internal'] = deepcopy(meta['calibration']['internal'])
+        sample['internal']['T_camera_lidar'][1][3] += index * 0.01
     calibration, report = solve_session(meta, URDF)
     assert report['status'] == 'accepted', report
     translation, angle = difference(
@@ -151,6 +154,17 @@ def test_per_observation_internal_extrinsics_override_old_session_snapshot(
     )
     assert translation < 0.001
     assert angle < 0.1
+    assert calibration['version'] == 2
+    assert calibration['factory_internal'] == meta['factory_internal']
+
+
+def write_factory_snapshot(directory, meta):
+    write_yaml(directory / 'odin_calib.yaml', {
+        'cam_0': meta['calibration']['odin'],
+        'Tcl_0': np.array(
+            meta['factory_internal']['T_camera_lidar']
+        ).ravel().tolist(),
+    })
 
 
 def test_reversed_order_and_corrupt_pair_rejected(dataset):
@@ -202,6 +216,7 @@ def test_no_validation_is_not_accepted(dataset):
 def test_session_tampering_and_pairing(tmp_path, dataset):
     meta, _, _ = dataset
     (tmp_path / 'robot.urdf').write_text(URDF)
+    write_factory_snapshot(tmp_path, meta)
     write_yaml(tmp_path / 'session.yaml', meta)
     loaded, _ = load_session(tmp_path)
     assert len(loaded['samples']) == 42
@@ -222,6 +237,7 @@ def test_offline_commands_export_reports_and_validation_overlays(
     session.mkdir()
     (session / 'images').mkdir()
     (session / 'robot.urdf').write_text(URDF)
+    write_factory_snapshot(session, meta)
     write_yaml(session / 'session.yaml', meta)
     for sample in meta['samples']:
         if sample['role'] == 'validation':
@@ -252,3 +268,70 @@ def test_offline_commands_export_reports_and_validation_overlays(
         == 0
     )
     assert len(list((validation / 'overlays').glob('*.jpg'))) == 24
+
+
+def test_legacy_session_uses_saved_factory_file(tmp_path, dataset):
+    meta, _, _ = dataset
+    write_factory_snapshot(tmp_path, meta)
+    del meta['factory_internal']
+    (tmp_path / 'robot.urdf').write_text(URDF)
+    write_yaml(tmp_path / 'session.yaml', meta)
+    loaded, _ = load_session(tmp_path)
+    assert loaded['factory_internal']['T_imu_lidar'][0][3] == -0.02663
+    assert loaded['calibration_sha256'] == meta['calibration_sha256']
+    (tmp_path / 'odin_calib.yaml').unlink()
+    with pytest.raises(OSError):
+        load_session(tmp_path)
+
+
+def test_validation_rejects_old_result_and_changed_factory(dataset):
+    meta, _, _ = dataset
+    calibration, _ = solve_session(meta, URDF)
+    calibration['version'] = 1
+    with pytest.raises(ValueError, match='Legacy result'):
+        evaluate(meta, URDF, calibration, [])
+    calibration['version'] = 2
+    calibration['factory_internal'] = deepcopy(calibration['factory_internal'])
+    calibration['factory_internal']['T_camera_lidar'][0][3] += 0.01
+    with pytest.raises(ValueError, match='factory geometry differs'):
+        evaluate(meta, URDF, calibration, [])
+
+
+def test_factory_rotation_rounding_and_invalid_input():
+    cl = np.array([
+        [-0.01267, -0.99991, -0.00533, 0.04060],
+        [0.00056, 0.00533, -0.99999, -0.00472],
+        [0.99992, -0.01267, 0.00049, -0.00794],
+        [0, 0, 0, 1],
+    ])
+    internal = factory_extrinsics({'Tcl_0': cl.ravel().tolist()})
+    normalized = np.array(internal['T_camera_lidar'])
+    np.testing.assert_allclose(normalized[:3, 3], cl[:3, 3], atol=1e-12)
+    np.testing.assert_allclose(
+        normalized[:3, :3].T @ normalized[:3, :3], np.eye(3), atol=1e-12
+    )
+    assert np.linalg.det(normalized[:3, :3]) == pytest.approx(1)
+    with pytest.raises(ValueError, match='contain Tcl_0'):
+        factory_extrinsics({})
+    with pytest.raises(ValueError, match='16 values'):
+        factory_extrinsics({'Tcl_0': [1, 2]})
+    cl[0, 0] = 2
+    with pytest.raises(ValueError, match='rotation'):
+        factory_extrinsics({'Tcl_0': cl.tolist()})
+
+
+@pytest.mark.parametrize('change', ['extrinsics', 'intrinsics'])
+def test_saved_factory_mismatch_rejected(tmp_path, dataset, change):
+    meta, _, _ = dataset
+    write_factory_snapshot(tmp_path, meta)
+    (tmp_path / 'robot.urdf').write_text(URDF)
+    write_yaml(tmp_path / 'session.yaml', meta)
+    from x2_camera_calibration.session import load_yaml
+    snapshot = load_yaml(tmp_path / 'odin_calib.yaml')
+    if change == 'extrinsics':
+        snapshot['Tcl_0'][3] += 0.01
+    else:
+        snapshot['cam_0']['A11'] += 1
+    write_yaml(tmp_path / 'odin_calib.yaml', snapshot)
+    with pytest.raises(ValueError, match='differs?'):
+        load_session(tmp_path)

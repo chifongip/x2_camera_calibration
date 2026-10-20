@@ -42,10 +42,9 @@ Default topics:
 | Head calibration | `/aima/hal/sensor/rgb_head_front_center/camera_info` |
 | Head joints | `/aima/hal/joint/head/state` |
 | Odin JPEG | `/odin1/image/compressed` |
-| Odin internal calibration | `/odin1/wiwc` |
 
-All topics can be overridden with `capture --help`. Images must have the same
-dimensions as their calibration. Head `CameraInfo` uses all supplied distortion
+Image and head topics can be overridden with `capture --help`. Images must have
+the same dimensions as their calibration. Head `CameraInfo` uses all supplied distortion
 coefficients, including its eight-coefficient rational model even if labeled
 `plumb_bob`. Odin requires its original **FishPoly** `cam_0` calibration;
 OpenCV's four-coefficient fisheye model is not interchangeable.
@@ -102,12 +101,12 @@ with less than **0.2 degrees** of angular variation. Head timestamps use
 `header.meas_stamp` if nonzero, otherwise `header.stamp`; no reception-time
 substitution or arbitrary time offset is applied. Missing, stale, invalid, or
 changed camera intrinsics are reported in the preview and block capture.
-Odin may refine its `/odin1/wiwc` internal extrinsics while running. Each saved
-observation includes its own internal matrices and their timestamp; small online
-updates do not require restarting the session. Invalid matrices still block
-capture. The solver uses each observation's matrices when converting the camera
-calibration into the torso-to-IMU mounting transform. Older sessions without
-per-observation matrices use their original session-wide snapshot.
+Internal sensor geometry comes from the device-specific `Tcl_0` in the
+`--odin-calib` file and the manufacturer's fixed IMU–LiDAR transform. Capture
+checks that `Tcl_0` is a valid rigid transform before creating a session and
+saves the factory geometry with the dataset. `/odin1/wiwc` is not subscribed to
+and is not required for capture, solving, or validation. The former
+`--odin-internal` option is accepted for command compatibility but ignored.
 Exposure synchronization is not guaranteed; stationary board capture is required.
 
 The checkerboard detector can reverse row or column ordering. The tool tracks
@@ -197,8 +196,8 @@ ros2 run x2_camera_calibration validate \
 
 Output directories must be new. A later validation session can be captured with
 `--role validation`; camera intrinsics and the URDF snapshot must match the
-training session, and observation IDs must not overlap. Internal extrinsics are
-recorded independently for each observation. Capture generates globally unique
+training session, and observation IDs must not overlap. Factory internal
+geometry must match between training and validation sessions. Capture generates globally unique
 IDs. Solve and validate exit **0** for accepted, **2** for requires-review, and
 **1** for invalid input or processing failure. Candidate calibrations and reports
 are written even when commissioning targets are missed.
@@ -206,10 +205,11 @@ are written even when commissioning targets are missed.
 Files include:
 
 - `session.yaml`, original JPEG pairs, `robot.urdf`, and `odin_calib.yaml`:
-  captured corners, roles, stamps, head-state history, per-observation internal
+  captured corners, roles, stamps, head-state history, factory internal
   extrinsics, and input fingerprints.
 - `calibration.yaml`: matrices, translation in meters, **x/y/z/w** quaternions,
-  frames, assumptions, retained/rejected training IDs, and source calibration.
+  frames, assumptions, retained/rejected training IDs, source calibration, and
+  the authoritative `factory_internal` geometry (result format version 2).
 - `report.yaml`: native-image reprojection RMS/p95 and per-observation mounting
   repeatability, acceptance status, and explicit failures.
 - `overlays/`: validation images with observed corners in green and predicted
@@ -229,9 +229,23 @@ T_imu_camera = T_imu_lidar * inverse(T_camera_lidar)
 T_torso_imu = T_torso_head_camera * T_head_camera_odin_camera * inverse(T_imu_camera)
 ```
 
-`/odin1/wiwc` is used only as the driver's internal-calibration container: its
-first 16 pose-covariance entries encode `T_camera_lidar`, and first 16
-twist-covariance entries encode `T_imu_lidar`. Its pose is not robot odometry.
+`T_camera_lidar` is the connected device's **`Tcl_0`**, which maps LiDAR
+coordinates into camera coordinates. Its decimal-rounded rotation is projected
+onto SO(3) using SVD before inversion. `T_imu_lidar` has identity rotation and
+translation **[-0.02663, 0.03447, 0.02174] m**, following the
+[Odin1 hardware documentation](https://manifoldtechltd.github.io/wiki/en/odin_series/odin1/5.%20Data%20output_.html#52-extrinsic-description).
+Thus URDF `odin_imu_to_lidar` uses `T_imu_lidar` directly, while
+`odin_lidar_to_camera_optical` uses inverse `Tcl_0`. The torso-to-IMU mount is
+estimated from the camera calibration and these factory relationships.
+
+Older capture sessions can be solved again if they contain their saved
+`odin_calib.yaml`; their original fingerprints and diagnostic `/wiwc` matrices
+are preserved, but those diagnostic matrices are not used for physical geometry.
+Results produced by the former solver (version 1) must be solved again into a
+**new output directory** before validation or use. The validator rejects legacy
+results and factory-geometry mismatches rather than mixing conventions. Existing
+results and captures are never overwritten.
+
 Head kinematics come directly from the specified URDF and measured joint angles;
 the tool does not require another state publisher or controller manager.
 

@@ -10,6 +10,11 @@ import yaml
 from .geometry import rigid
 
 HEAD_JOINTS = ('head_yaw_joint', 'head_pitch_joint')
+FACTORY_GEOMETRY_SOURCE = (
+    'https://manifoldtechltd.github.io/wiki/en/odin_series/odin1/'
+    '5.%20Data%20output_.html#52-extrinsic-description'
+)
+
 
 
 def plain(value):
@@ -87,16 +92,25 @@ def stable_head(samples, stamp, max_gap=0.1, window=0.5, spread_deg=0.2):
     }
 
 
-def internal_extrinsics(message):
-    camera_from_lidar = rigid(
-        np.asarray(message.pose.covariance[:16]).reshape(4, 4)
-    )
-    imu_from_lidar = rigid(
-        np.asarray(message.twist.covariance[:16]).reshape(4, 4)
-    )
+def factory_extrinsics(calibration):
+    """Use device Tcl_0 and documented fixed IMU-LiDAR hardware geometry."""
+    if 'Tcl_0' not in calibration:
+        raise ValueError('Odin factory calibration must contain Tcl_0')
+    values = np.asarray(calibration['Tcl_0'], dtype=float)
+    if values.size != 16:
+        raise ValueError('Tcl_0 must contain 16 values')
+    camera_from_lidar = rigid(values.reshape(4, 4)).copy()
+    # Factory YAML rounds rotation entries; URDF requires an SO(3) rotation.
+    u, _, vt = np.linalg.svd(camera_from_lidar[:3, :3])
+    camera_from_lidar[:3, :3] = u @ vt
+    imu_from_lidar = np.eye(4)
+    imu_from_lidar[:3, 3] = [-0.02663, 0.03447, 0.02174]
     return {
         'T_camera_lidar': camera_from_lidar.tolist(),
         'T_imu_lidar': imu_from_lidar.tolist(),
+        'source': FACTORY_GEOMETRY_SOURCE,
+        'camera_source': 'odin_calib.yaml:Tcl_0',
+        'rotation_normalization': 'SVD projection onto SO(3)',
     }
 
 
@@ -121,7 +135,7 @@ def consistent(reference, current, tolerance=1e-7):
 
 
 def camera_models_match(reference, current):
-    """Intrinsics are fixed; /wiwc extrinsics may be refined online."""
+    """Compare fixed camera intrinsics independently of legacy diagnostics."""
     return all(
         consistent(reference[name], current[name]) for name in ('head', 'odin')
     )
@@ -161,4 +175,18 @@ def load_session(directory):
                 rigid(sample['internal'][name])
     if fingerprint(metadata['calibration']) != metadata['calibration_sha256']:
         raise ValueError('Calibration snapshot fingerprint mismatch')
+    # Legacy sessions retain their original fingerprints and diagnostic matrices.
+    # Always derive physical geometry from the saved device calibration file.
+    factory_file = load_yaml(directory / 'odin_calib.yaml')
+    factory = factory_extrinsics(factory_file)
+    if 'factory_internal' in metadata and not consistent(
+        metadata['factory_internal'], factory
+    ):
+        raise ValueError('Factory geometry differs from odin_calib.yaml snapshot')
+    if not consistent(
+        metadata['calibration']['odin'],
+        factory_file['cam_0'],
+    ):
+        raise ValueError('Factory camera intrinsics differ from session snapshot')
+    metadata['factory_internal'] = factory
     return metadata, urdf

@@ -46,11 +46,12 @@ def models_for(metadata):
     return calibration['head'], calibration['odin']
 
 
-def imu_from_camera(metadata, sample=None):
-    # Older sessions store only a session-wide snapshot.
-    internal = (sample or {}).get(
-        'internal', metadata['calibration']['internal']
-    )
+def imu_from_camera(metadata):
+    if 'factory_internal' not in metadata:
+        raise ValueError(
+            'Missing factory geometry; load the session with its odin_calib.yaml'
+        )
+    internal = metadata['factory_internal']
     return rigid(internal['T_imu_lidar']) @ inverse(internal['T_camera_lidar'])
 
 
@@ -118,7 +119,7 @@ def torso_from_imu(metadata, kinematics, sample, head_from_odin):
     return (
         kinematics.transform(sample['head_positions'])
         @ rigid(head_from_odin)
-        @ inverse(imu_from_camera(metadata, sample))
+        @ inverse(imu_from_camera(metadata))
     )
 
 
@@ -136,6 +137,15 @@ def error_summary(values):
 def evaluate(
     metadata, urdf, calibration, samples, session_dir=None, output_dir=None
 ):
+    if calibration.get('version') != 2:
+        raise ValueError(
+            'Legacy result uses unverified internal geometry; solve again '
+            'into a new output directory with the updated tool'
+        )
+    if fingerprint(calibration['factory_internal']) != fingerprint(
+        metadata['factory_internal']
+    ):
+        raise ValueError('Validation factory geometry differs from training')
     kinematics = HeadKinematics(urdf)
     mounting = rigid(calibration['T_torso_odin_imu']['matrix'])
     head, odin = models_for(metadata)
@@ -147,7 +157,7 @@ def evaluate(
         head_from_odin = (
             inverse(kinematics.transform(sample['head_positions']))
             @ mounting
-            @ imu_from_camera(metadata, sample)
+            @ imu_from_camera(metadata)
         )
         errors, predictions = observation_errors(
             metadata, sample, head_from_odin
@@ -333,7 +343,8 @@ def solve_session(metadata, urdf):
         ]
     )
     calibration = {
-        'version': 1,
+        'version': 2,
+        'factory_internal': metadata['factory_internal'],
         'transform_convention': 'T_A_B maps coordinates in B into A',
         'units': {'translation': 'm', 'quaternion': 'xyzw'},
         'board': metadata['board'],
